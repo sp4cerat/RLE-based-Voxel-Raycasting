@@ -1,0 +1,201 @@
+// includes, system
+//#define DETAIL_BENCH
+
+//budda 35.6 fps
+//7.05 total * fps = 250.98
+//2.02 proc  * fps = 71.912
+//0.55 visible*fps = 19.58
+//0.42 pix    *fps = 14.9
+//0.78 pix    *fps = 27.9
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#define IN_CUDA_ENV
+#ifdef _WIN32
+#  define WINDOWS_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+#include <cutil.h>
+#include <cuda_gl_interop.h>
+#include "CudaMath.h"
+////////////////////////////////////////////////////////////////////////////////
+#include "RayMap.h"
+#include "Cuda_Render.h"
+#include "Rle4.h"
+////////////////////////////////////////////////////////////////////////////////
+extern "C" void cuda_main_render2( int pbo_out, int width, int height,RayMap_GPU* raymap);
+extern "C" void pboRegister(int pbo);
+extern "C" void pboUnregister(int pbo);
+int	cpu_to_gpu_delta=0;
+////////////////////////////////////////////////////////////////////////////////
+void gpu_memcpy(void* dst, void* src, int size)
+{
+	CUDA_SAFE_CALL( cudaMemcpy( dst, src, size, cudaMemcpyHostToDevice) );
+}
+////////////////////////////////////////////////////////////////////////////////
+void cpu_memcpy(void* dst, void* src, int size)
+{
+	CUDA_SAFE_CALL( cudaMemcpy( dst, src, size, cudaMemcpyDeviceToHost) );
+}
+////////////////////////////////////////////////////////////////////////////////
+void* gpu_malloc(int size)
+{
+	void* ptr;	
+	CUDA_SAFE_CALL( cudaMalloc( (void**) &ptr, size ) );
+	if(ptr==0){printf("cudaMalloc( (void**) &ptr, size ) no mem\n");while(1);;}
+	return ptr;
+}
+////////////////////////////////////////////////////////////////////////////////
+__global__ void
+cudaRender(
+		   Render* render_local,
+		   int maxrays, 
+		   vec3f viewpos, 
+		   vec3f viewrot, 
+		   int res_x, 
+		   int res_y
+		  )
+{
+    extern __shared__ int sdata[];
+   
+    int x = (blockIdx.x * blockDim.x + threadIdx.x);
+   
+	//if(x&1)return;
+    if (x>=maxrays) return;
+    
+    //render_local->render_line(x,(unsigned int*)&sdata[((x)&127)*31]);
+    render_local->render_line
+	(
+		x,
+		(unsigned int*)&sdata[((x)&127)*31],
+		viewpos,
+		viewrot,
+		res_x,
+		res_y
+	);
+
+	return;
+}
+////////////////////////////////////////////////////////////////////////////////
+void cuda_main_render2( int pbo_out, int width, int height,RayMap_GPU* raymap)
+{
+	int t0 = timeGetTime();
+
+	if(pbo_out==0) return;
+
+    static Render render;
+    static Render *render_gpu=(Render*) ((char*)bmalloc(sizeof(Render))+cpu_to_gpu_delta);
+    
+    if((int)render_gpu==cpu_to_gpu_delta){ printf("render_gpu 0 \n");while(1);;}
+    int lines_to_raycast = raymap->map_line_count;
+    int thread_calls = (raymap->map_line_count | 127) +1;
+    if (lines_to_raycast>MAX_RAYS ) lines_to_raycast=MAX_RAYS;
+    int* out_data;   
+    CUDA_SAFE_CALL(cudaGLMapBufferObject( (void**)&out_data, pbo_out));   
+	if(out_data==0) return;
+
+	dim3 threads( 128,1,1 );
+    dim3 grid( thread_calls / threads.x,1,1 );
+
+    render.set_target( width, height, (int*) out_data);
+  	render.set_raymap( raymap );
+
+#ifdef DETAIL_BENCH
+	for(int t=0;t<MAX_RAYS;t++)
+	{
+		render.perf[t].elems_total=0;
+		render.perf[t].elems_processed=0;
+		render.perf[t].elems_rendered=0;
+		render.perf[t].pixels=0;
+	}
+#endif
+	
+	gpu_memcpy(render_gpu, &render, sizeof(Render));
+   
+	int t1 = timeGetTime();CUDA_SAFE_CALL( cudaThreadSynchronize() );
+
+	cudaRender<<< grid, threads, 16300 >>>
+	(
+		render_gpu,
+		render.ray_map.map_line_count,
+		render.ray_map.position,
+		render.ray_map.rotation,
+		render.res_x,
+		render.res_y
+	);
+
+	CUDA_SAFE_CALL( cudaThreadSynchronize() );
+	int t2 = timeGetTime();
+
+#ifdef DETAIL_BENCH
+	cpu_memcpy(&render.perf[0],&(render_gpu->perf[0]),  sizeof(Render::Perf)*MAX_RAYS);
+	Render::Perf p;
+	p.elems_total=0;
+	p.elems_processed=0;
+	p.elems_rendered=0;
+	p.pixels=0;
+	for(int t=0;t<MAX_RAYS;t++)
+	{
+		p.elems_total+=render.perf[t].elems_total;
+		p.elems_processed+=render.perf[t].elems_processed;
+		p.elems_rendered+=render.perf[t].elems_rendered;
+		p.pixels+=render.perf[t].pixels;
+	}
+	
+	printf ("total %2.2fM proc %2.2fM ren %2.2fM pix %2.2fM ",
+		float(p.elems_total)/(1000*1000),
+		float(p.elems_processed)/(1000*1000),
+		float(p.elems_rendered)/(1000*1000),
+		float(p.pixels)/(1000*1000));
+#endif		
+	//printf ("mem%d ren%d ",t1-t0,t2-t1);
+    
+    CUDA_SAFE_CALL(cudaGLUnmapBufferObject( pbo_out));
+}
+////////////////////////////////////////////////////////////////////////////////
+void pboRegister(int pbo)
+{
+    // register this buffer object with CUDA
+    CUDA_SAFE_CALL(cudaGLRegisterBufferObject(pbo));
+}
+////////////////////////////////////////////////////////////////////////////////
+void pboUnregister(int pbo)
+{
+    // unregister this buffer object with CUDA
+    CUDA_SAFE_CALL(cudaGLUnregisterBufferObject(pbo));
+}
+////////////////////////////////////////////////////////////////////////////////
+/*
+__global__ void
+cudaColorNodes(uint* nodebuf)
+{
+    int x = (blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (blockIdx.y * blockDim.y + threadIdx.y);
+
+	ushort* node = (ushort*)(((uint*)nodebuf) [x+y*1024]);
+
+	uint col_rgb=0xff8844;
+	if(node)
+	{
+		ushort col=(ushort)*node;
+
+		const int col_r[4]={130 ,255,255,155};
+		const int col_g[4]={255 ,155,0  ,255};
+		const int col_b[4]={130 ,0  ,0  ,0};						
+
+		int col_o=(col>>8)&3;				
+		int bright = col&255 ;
+
+		int r_=(bright*col_r[col_o])>>8;
+		int g_=(bright*col_g[col_o])>>8;
+		int b_=(bright*col_b[col_o])>>8;
+
+		col_rgb = r_+(g_<<8)+(b_<<16) ;
+	}
+
+	((uint*)nodebuf) [x+y*1024] = col_rgb;
+}
+*/
+////////////////////////////////////////////////////////////////////////////////
